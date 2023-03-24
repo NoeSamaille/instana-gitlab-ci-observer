@@ -1,0 +1,6 @@
+python-gitlab
+flask 
+httplib2
+python-dateutil
+pyyaml
+instana
