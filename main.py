@@ -113,7 +113,7 @@ def awx_webhook():
         awx_job_error = False
     else:
         awx_job_error = True
-    
+
     awx_jobs[f'{pipeline_id}-{job_id}'] = {
         "id": awx_job_id,
         "start_time": awx_job_start_time,
@@ -129,91 +129,90 @@ def awx_webhook():
 
 @app.post('/gitlab-ci')
 def index():
-    if "webhook-token" not in config["gitlab"] or config["gitlab"]["webhook-token"] == "" or config["gitlab"]["webhook-token"] == request.headers['X-Gitlab-Event']:
 
-        content = request.get_json(silent=True)
+    content = request.get_json(silent=True)
 
-        if content["object_kind"] == "pipeline":
-            pipeline_id = content["object_attributes"]["id"]
+    if content["object_kind"] == "pipeline" and content["object_attributes"]["status"] in ("success", "failed"):
+        print("----------------------------- Gitlab event -> Final Event")
 
-            if content["object_attributes"]["status"] in ("success", "failed"):
-                print("----------------------------- Gitlab event -> Final Event")
+        pipeline_id = content["object_attributes"]["id"]
+        project_id = content['project']['id']
+        pipeline_start_date = parser.parse(
+            content["object_attributes"]["created_at"])
+        pipeline_end_date = parser.parse(
+            content["object_attributes"]["finished_at"])
+        pipeline_start_time = pipeline_start_date.timestamp()
+        pipeline_duration = (
+            pipeline_end_date-pipeline_start_date).total_seconds()
+        pipeline_name = f"Pipeline {content['project']['path_with_namespace']}/{content['object_attributes']['id']}"
+        if content["object_attributes"]["status"] in ('failed'):
+            pipeline_error = True
+        else:
+            pipeline_error = False
+        pipeline_url = get_pipeline(project_id, pipeline_id)
+        print(f"{pipeline_name} {pipeline_start_date}")
 
-                project_id = content['project']['id']
-                pipeline_start_date = parser.parse(
-                    content["object_attributes"]["created_at"])
-                pipeline_end_date = parser.parse(
-                    content["object_attributes"]["finished_at"])
-                pipeline_start_time = pipeline_start_date.timestamp()
-                pipeline_duration = (
-                    pipeline_end_date-pipeline_start_date).total_seconds()
-                pipeline_name = f"Pipeline {content['project']['path_with_namespace']}/{content['object_attributes']['id']}"
-                if content["object_attributes"]["status"] in ('failed'):
-                    pipeline_error = True
+        pipeline_span = opentracing.tracer.start_span(
+            pipeline_name, start_time=pipeline_start_time)
+        pipeline_span.set_tag('span.kind', 'entry')
+        pipeline_span.set_tag('url', pipeline_url)
+        pipeline_span.set_tag('error', pipeline_error)
+
+        for job in content["builds"]:
+            if job["status"] in ("success", "failed"):
+                job_id = job["id"]
+                job_start_date = parser.parse(job["started_at"])
+                job_start_time = job_start_date.timestamp()
+                job_duration = int(job["duration"])
+                job_name = f'Job {job["name"]}'
+                if job["status"] in ('failed'):
+                    job_error = True
                 else:
-                    pipeline_error = False
-                pipeline_url = get_pipeline(project_id, pipeline_id)
-                print(f"{pipeline_name} {pipeline_start_date}")
+                    job_error = False
+                job_url, job_log = get_job(project_id, job_id)
 
-                pipeline_span = opentracing.tracer.start_span(
-                    pipeline_name, start_time=pipeline_start_time)
-                pipeline_span.set_tag('span.kind', 'entry')
-                pipeline_span.set_tag('url', pipeline_url)
-                pipeline_span.set_tag('error', pipeline_error)
+                job_span = opentracing.tracer.start_span(
+                    job_name, start_time=job_start_time, child_of=pipeline_span)
+                job_span.set_tag('span.kind', 'exit')
+                job_span.set_tag('url', job_url)
+                job_span.set_tag('error', job_error)
+                job_span.finish(job_start_time+job_duration)
 
-                for job in content["builds"]:
-                    if job["status"] in ("success", "failed"):
-                        job_id = job["id"]
-                        job_start_date = parser.parse(job["started_at"])
-                        job_start_time = job_start_date.timestamp()
-                        job_duration = int(job["duration"])
-                        job_name = f'Job {job["name"]}'
-                        if job["status"] in ('failed'):
-                            job_error = True
-                        else:
-                            job_error = False
-                        job_url, job_log = get_job(project_id, job_id)
+                print(f"{job_name} {job_start_date}")
+                if job["status"] in ('failed'):
+                    log_span = opentracing.tracer.start_span(
+                        'log', start_time=job_start_time+job_duration, child_of=job_span)
+                    job_span.set_tag('span.kind', 'exit')
+                    # log_span.log_kv({'message':'mind the hole'}) # Warning log
+                    log_span.log_exception(job_log[-10000:])
+                    log_span.finish(job_start_time+job_duration+.001)
 
-                        job_span = opentracing.tracer.start_span(
-                            job_name, start_time=job_start_time, child_of=pipeline_span)
-                        job_span.set_tag('span.kind', 'exit')
-                        job_span.set_tag('url', job_url)
-                        job_span.set_tag('error', job_error)
-                        job_span.finish(job_start_time+job_duration)
+                # Handles (if applicable) related AWX job
+                if f'{pipeline_id}-{job_id}' in awx_jobs:
+                    payload = awx_jobs[f'{pipeline_id}-{job_id}']
+                    awx_job_span = opentracing.tracer.start_span(
+                        payload['name'], start_time=payload['start_time'], child_of=job_span)
+                    awx_job_span.set_tag('span.kind', 'exit')
+                    awx_job_span.set_tag('url', payload['url'])
+                    awx_job_span.set_tag('error', payload['error'])
+                    awx_job_span.set_tag('name', payload['name'])
+                    awx_job_span.finish(
+                        payload['start_time']+payload['duration'])
+                    if payload['error']:
+                        aws_log_span = opentracing.tracer.start_span(
+                            'log', start_time=payload['start_time']+payload['duration'], child_of=awx_job_span)
+                        aws_log_span.set_tag('span.kind', 'exit')
+                        # log_span.log_kv({'message':'mind the hole'}) # Warning log
+                        aws_log_span.log_exception(
+                            payload['logs'][-10000:])
+                        aws_log_span.finish(
+                            payload['start_time']+payload['duration']+.001)
+                    awx_jobs.pop(f'{pipeline_id}-{job_id}', None)
 
-                        print(f"{job_name} {job_start_date}")
-                        if job["status"] in ('failed'):
-                            log_span = opentracing.tracer.start_span(
-                                'log', start_time=job_start_time+job_duration, child_of=job_span)
-                            job_span.set_tag('span.kind', 'exit')
-                            # log_span.log_kv({'message':'mind the hole'}) # Warning log
-                            log_span.log_exception(job_log[-10000:])
-                            log_span.finish(job_start_time+job_duration+.001)
-                        
-                        # Handles (if applicable) related AWX job
-                        if f'{pipeline_id}-{job_id}' in awx_jobs:
-                            payload = awx_jobs[f'{pipeline_id}-{job_id}']
-                            awx_job_span = opentracing.tracer.start_span(
-                                payload['name'], start_time=payload['start_time'], child_of=job_span)
-                            awx_job_span.set_tag('span.kind', 'exit')
-                            awx_job_span.set_tag('url', payload['url'])
-                            awx_job_span.set_tag('error', payload['error'])
-                            awx_job_span.set_tag('name', payload['name'])
-                            awx_job_span.finish(payload['start_time']+payload['duration'])
-                            if payload['error']:
-                                aws_log_span = opentracing.tracer.start_span(
-                                    'log', start_time=payload['start_time']+payload['duration'], child_of=awx_job_span)
-                                aws_log_span.set_tag('span.kind', 'exit')
-                                # log_span.log_kv({'message':'mind the hole'}) # Warning log
-                                aws_log_span.log_exception(payload['logs'][-10000:])
-                                aws_log_span.finish(payload['start_time']+payload['duration']+.001)
-                            awx_jobs.pop(f'{pipeline_id}-{job_id}', None)
+        pipeline_span.finish(
+            pipeline_start_time+pipeline_duration)
 
-                pipeline_span.finish(
-                    pipeline_start_time+pipeline_duration)
-
-        return 'OK\n'
-
+    return 'OK\n'
 
 if __name__ == "__main__":
     load_config()
