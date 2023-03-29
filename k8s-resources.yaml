@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    kubernetes.io/metadata.name: instana-gitlab-ci-observer
+  name: instana-gitlab-ci-observer
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: instana-gitlab-ci-observer-config
+  namespace: instana-gitlab-ci-observer
+type: Opaque
+stringData:
+  config.yaml: |
+    gitlab:
+      url: https://gitlab.example.com # CHANGEME
+      api-token: gitlab-pat # CHANGEME
+    awx:
+      url: http://awx.example.com # CHANGEME
+      user: admin # CHANGEME
+      password: adminPassword # CHANGEME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: instana-gitlab-ci-observer
+  labels:
+    app: instana-gitlab-ci-observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: instana-gitlab-ci-observer
+  template:
+    metadata:
+      labels:
+        app: instana-gitlab-ci-observer
+    spec:
+      volumes:
+        - name: config
+          secret:
+            secretName: instana-gitlab-ci-observer-config
+      containers:
+        - name: instana-gitlab-ci-observer
+          image: quay.io/noesamaille0/instana-gitlab-ci-observer:latest
+          env:
+            - name: INSTANA_DISABLE_AUTO_INSTR
+              value: "true"
+          volumeMounts:
+            - mountPath: /opt/app-root/src/config.yaml
+              name: config
+              subPath: config.yaml
+          ports:
+            - containerPort: 8088
+          resources:
+            limits:
+              memory: 256Mi
+              cpu: 500m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: instana-gitlab-ci-observer
+spec:
+  selector:
+    app: instana-gitlab-ci-observer
+  ports:
+  - port: 8088
+    targetPort: 8088
